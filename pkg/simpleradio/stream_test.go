@@ -577,24 +577,33 @@ func (f *streamingFixture) serverMessage(t *testing.T, m types.Message) {
 func TestStreamCoalitionMetadataAndDisconnectFiltering(t *testing.T) {
 	f := newStreamingFixture(t, nil)
 	sender := types.GUID("1111111111111111111111")
+	other := types.GUID("2222222222222222222222")
 	audio := streamFixtureAudio(t)
 	f.serverMessage(t, types.Message{Type: types.MessageServerSettings, ServerSettings: map[string]string{string(types.CoalitionAudioSecurity): "true"}})
+	f.serverMessage(t, types.Message{Type: types.MessageUpdate, Client: &types.ClientInfo{GUID: other, Coalition: coalitions.Blue}})
 	f.inject(streamFixturePacket(audio, sender, 1)) // Unknown sender cannot pass secure-coalition filtering.
+	// UDP injection only queues a packet; it does not wait for dispatch. Observe
+	// the following known sender as a FIFO barrier before making sender known,
+	// so the metadata update cannot race ahead of the unknown packet's filter.
+	f.inject(streamFixturePacket(audio, other, 1))
+	event := nextStreamEvent(t, f.stream)
+	if event.Metadata.OriginGUID != other || event.Metadata.PacketID != 1 {
+		t.Fatalf("unknown sender passed secure-coalition filtering: %+v", event)
+	}
 	f.serverMessage(t, types.Message{Type: types.MessageUpdate, Client: &types.ClientInfo{GUID: sender, Coalition: coalitions.Blue}})
 	f.inject(streamFixturePacket(audio, sender, 2))
-	event := nextStreamEvent(t, f.stream)
-	if event.Metadata.PacketID != 2 || !event.Metadata.CoalitionKnown || event.Metadata.Coalition != coalitions.Blue {
+	event = nextStreamEvent(t, f.stream)
+	if event.Metadata.OriginGUID != sender || event.Metadata.PacketID != 2 || !event.Metadata.CoalitionKnown || event.Metadata.Coalition != coalitions.Blue {
 		t.Fatalf("coalition metadata/filter: %+v", event)
 	}
 	f.serverMessage(t, types.Message{Type: types.MessageClientDisconnect, Client: &types.ClientInfo{GUID: sender}})
 	f.inject(streamFixturePacket(audio, sender, 3))
-	// A different known sender proves dispatch has progressed beyond the removed peer's packet.
-	other := types.GUID("2222222222222222222222")
-	f.serverMessage(t, types.Message{Type: types.MessageUpdate, Client: &types.ClientInfo{GUID: other, Coalition: coalitions.Blue}})
-	f.inject(streamFixturePacket(audio, other, 1))
+	// The same known sender proves dispatch passed the disconnected peer's
+	// packet without changing either peer's metadata during that dispatch.
+	f.inject(streamFixturePacket(audio, other, 2))
 	event = nextStreamEvent(t, f.stream)
-	if event.Metadata.OriginGUID != other {
-		t.Fatal("disconnected peer retained known coalition")
+	if event.Metadata.OriginGUID != other || event.Metadata.PacketID != 2 {
+		t.Fatalf("disconnected peer retained known coalition: %+v", event)
 	}
 }
 
