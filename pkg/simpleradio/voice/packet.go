@@ -15,7 +15,7 @@ import (
 // A frequency segment containing each frequency the audio is transmitted on
 // A fixed segment containing metadata
 //
-// See SRS source code for packet encoding: https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/master/DCS-SR-Common/Network/UDPVoicePacket.cs
+// See SRS source code for packet encoding: https://github.com/ciribob/DCS-SimpleRadioStandalone/blob/d01f540ce5e363e9ac841775c8f7e2253138cd81/Common/Models/UDPVoicePacket.cs
 type Packet struct {
 	/* Headers */
 
@@ -60,7 +60,7 @@ type Packet struct {
 
 	// UnitID is the ID of the in-game unit that originated the packet.
 	//
-	// Bytes: PacketLength-58:PacketLength-53
+	// Bytes: PacketLength-57:PacketLength-53
 	//
 	// Length: 4 bytes
 	UnitID uint32
@@ -111,8 +111,8 @@ type Frequency struct {
 const (
 	// headerSegmentLength is the length of the header segment in bytes.
 	headerSegmentLength = 6
-	// fixedSegmentLength is the length of the fixed segment in bytes.
-	fixedSegmentLength = 58
+	// fixedSegmentLength is uint32 unit ID, uint64 packet ID, one hop byte and two GUIDs.
+	fixedSegmentLength = 4 + 8 + 1 + 2*types.GUIDLength
 	// frequencyLength is the length of a Frequency in bytes.
 	frequencyLength = 10
 )
@@ -166,7 +166,7 @@ func (p *Packet) Encode() []byte {
 	}
 
 	/* Fixed Segment */
-	fixedSegmentPtr := p.PacketLength - fixedSegmentLength + 1
+	fixedSegmentPtr := p.PacketLength - fixedSegmentLength
 	unitIDPtr := fixedSegmentPtr
 	packetIDPtr := unitIDPtr + 4
 	binary.LittleEndian.PutUint32(b[unitIDPtr:packetIDPtr], p.UnitID)
