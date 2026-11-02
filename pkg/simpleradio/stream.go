@@ -550,6 +550,9 @@ func (s *Stream) dispatch() {
 			for _, origin := range input.departed {
 				if state := senders[origin]; state != nil && !state.revoked {
 					state.active, state.revoked, state.decoder = false, true, nil
+					if !s.discardPendingSender(origin) {
+						return
+					}
 					// Control carries only the formerly admitted sender GUID. No
 					// stale unit/coalition/routes/audio are presented as new input.
 					if !s.emit(StreamEvent{Kind: StreamSenderDisconnected, Metadata: StreamMetadata{OriginGUID: origin}}) {
@@ -653,6 +656,28 @@ func (s *Stream) dispatch() {
 			if !s.emit(StreamEvent{Kind: StreamAudio, TransmissionID: state.id, Metadata: copyStreamMetadata(metadata), Frame: StreamFrame{PCM: pcm[:n:n], Opus: append([]byte(nil), packet.AudioBytes...)}, LostPackets: lost}) {
 				return
 			}
+		}
+	}
+}
+
+// Withdraw audio/gaps not yet consumed from this epoch. Already delivered
+// frames are canceled by the explicit control; other senders keep FIFO order.
+// Only dispatch calls this helper or emits to rx.
+func (s *Stream) discardPendingSender(origin types.GUID) bool {
+	retained := make([]StreamEvent, 0, len(s.rx))
+	for {
+		select {
+		case event := <-s.rx:
+			if event.Metadata.OriginGUID != origin || (event.Kind != StreamAudio && event.Kind != StreamGap) {
+				retained = append(retained, event)
+			}
+		default:
+			for _, event := range retained {
+				if !s.emit(event) {
+					return false
+				}
+			}
+			return true
 		}
 	}
 }

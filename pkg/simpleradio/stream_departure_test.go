@@ -80,3 +80,35 @@ func TestStreamUnadmittedDepartureProducesNoControlInput(t *testing.T) {
 		t.Fatalf("unadmitted peer created a control input: %+v", event)
 	}
 }
+
+func TestStreamDeparturePurgesPendingAudioAndGapButPreservesOtherSenders(t *testing.T) {
+	f := newStreamingFixture(t, nil)
+	sender := types.GUID("1111111111111111111111")
+	other := types.GUID("2222222222222222222222")
+	f.serverMessage(t, types.Message{Type: types.MessageUpdate, Client: &types.ClientInfo{GUID: sender, Coalition: coalitions.Blue}})
+	audio := streamFixtureAudio(t)
+	f.inject(streamFixturePacket(audio, sender, 1))
+	await := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for len(f.stream.rx) != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("pending receive count: got %d, want %d", len(f.stream.rx), want)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	await(1)
+	f.clock.advance(320 * time.Millisecond)
+	await(2) // Old audio and inferred completion have not been consumed.
+	f.inject(streamFixturePacket(audio, other, 1))
+	await(3)
+	f.serverMessage(t, types.Message{Type: types.MessageClientDisconnect, Client: &types.ClientInfo{GUID: sender}})
+	await(2)
+	if event := nextStreamEvent(t, f.stream); event.Kind != StreamAudio || event.Metadata.OriginGUID != other {
+		t.Fatalf("departure replayed withdrawn input or reordered other sender: %+v", event)
+	}
+	if event := nextStreamEvent(t, f.stream); event.Kind != StreamSenderDisconnected || event.Metadata.OriginGUID != sender {
+		t.Fatalf("missing departure after pending audio purge: %+v", event)
+	}
+}
