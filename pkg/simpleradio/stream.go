@@ -24,6 +24,9 @@ const (
 	StreamSampleRate    = 16000
 	StreamFrameSamples  = 640
 	StreamFrameDuration = 40 * time.Millisecond
+	// A small late timer wake may be corrected on the next absolute deadline.
+	// Larger stalls reanchor the cadence rather than causing a catchup burst.
+	streamPacingCatchupLimit = 5 * time.Millisecond
 )
 
 var (
@@ -751,8 +754,12 @@ func (s *Stream) discardPendingSender(origin types.GUID) bool {
 	return true
 }
 
-// Transmit consumes frames as they arrive; it sends the first immediately and
-// spaces subsequent packets by at least 40 ms. It buffers no complete utterance.
+// Transmit consumes frames as they arrive and targets a 40 ms packet cadence.
+// Up to 5 ms of lateness is corrected on the next deadline (at least 35 ms
+// spacing); larger stalls restart the cadence without a catchup burst. A new
+// producer call starts at least 40 ms after the previous successful write.
+// It sends the first frame immediately when that spacing permits and buffers no
+// complete utterance.
 // The input channel provides bounded producer backpressure (an unbuffered channel
 // is recommended). Only one producer may transmit per connection. A producer gap
 // greater than Underrun aborts the utterance; late frames are never replayed.
@@ -803,6 +810,7 @@ func (s *Stream) transmit(ctx context.Context, frames <-chan StreamFrame, stats 
 		frequencies = append(frequencies, voice.Frequency{Frequency: r.Frequency, Modulation: byte(r.Modulation), Encryption: encryption})
 	}
 	next := s.nextTransmit
+	first := true
 	for {
 		timer := s.opts.Clock.NewTimer(s.opts.Underrun)
 		var frame StreamFrame
@@ -889,8 +897,15 @@ func (s *Stream) transmit(ctx context.Context, frames <-chan StreamFrame, stats 
 		}
 		writtenAt := s.opts.Clock.Now()
 		stats.wrote(writtenAt)
-		next = writtenAt.Add(StreamFrameDuration)
-		s.nextTransmit = next
+		if first || next.IsZero() || writtenAt.Sub(next) > streamPacingCatchupLimit {
+			next = writtenAt.Add(StreamFrameDuration)
+		} else {
+			next = next.Add(StreamFrameDuration)
+		}
+		// Preserve actual-write spacing across calls, independently of this
+		// call's absolute cadence and any canceled or abandoned producer.
+		s.nextTransmit = writtenAt.Add(StreamFrameDuration)
+		first = false
 	}
 }
 

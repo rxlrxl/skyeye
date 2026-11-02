@@ -70,7 +70,7 @@ func TestStreamTransmitStatsBoundedIntervals(t *testing.T) {
 	}
 }
 
-func TestStreamTransmitStatsExposeAccumulatedPacingDelay(t *testing.T) {
+func TestStreamAbsolutePacingDoesNotAccumulateSmallWakeDelay(t *testing.T) {
 	f := newStreamingFixture(t, nil)
 	frames := make(chan StreamFrame, 100)
 	for range cap(frames) {
@@ -83,17 +83,21 @@ func TestStreamTransmitStatsExposeAccumulatedPacingDelay(t *testing.T) {
 		done <- streamStatsResult{stats, err}
 	}()
 	nextStreamVoice(t, f.udp)
-	for range 99 {
-		f.clock.awaitDeadlineCount(t, f.clock.Now().Add(StreamFrameDuration), 2)
+	firstAt := f.clock.Now()
+	for i := 1; i < 100; i++ {
+		target := firstAt.Add(time.Duration(i) * StreamFrameDuration)
+		count := 1
+		if i == 1 {
+			count = 2
+		}
+		f.clock.awaitDeadlineCount(t, target, count)
 		// Model a timer waking one ms late, with every producer frame ready.
-		// Current minimum-spacing pacing starts the next period at that wake;
-		// stats must expose its accumulated delay even without a >60 ms gap.
-		f.clock.advance(StreamFrameDuration + time.Millisecond)
+		f.clock.advance(target.Sub(f.clock.Now()) + time.Millisecond)
 		nextStreamVoice(t, f.udp)
 	}
 	result := awaitStreamStats(t, done)
 	s := result.stats
-	if result.err != nil || s.Packets != 100 || s.SumGap != 99*41*time.Millisecond || s.LastWriteAt.Sub(s.FirstWriteAt) != s.SumGap || s.MaxGap != 41*time.Millisecond || s.GapsOver60MS != 0 || len(s.GapEvents) != 0 {
+	if result.err != nil || s.Packets != 100 || s.SumGap != 99*StreamFrameDuration+time.Millisecond || s.LastWriteAt.Sub(s.FirstWriteAt) != s.SumGap || s.MaxGap != 41*time.Millisecond || s.GapsOver60MS != 0 || len(s.GapEvents) != 0 {
 		t.Fatalf("pacing delay observations: stats=%+v err=%v", s, result.err)
 	}
 	t.Logf("100 ready packets with 1 ms late pacing wakes: observed=%v nominal=%v delay=%v", s.SumGap, 99*StreamFrameDuration, s.SumGap-99*StreamFrameDuration)
