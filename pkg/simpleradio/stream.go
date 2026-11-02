@@ -47,8 +47,9 @@ type StreamFrame struct {
 type StreamEventKind string
 
 const (
-	StreamAudio StreamEventKind = "audio"
-	StreamGap   StreamEventKind = "gap"
+	StreamAudio              StreamEventKind = "audio"
+	StreamGap                StreamEventKind = "gap"
+	StreamSenderDisconnected StreamEventKind = "sender_disconnected"
 )
 
 // StreamMetadata preserves wire identity independently of display names. Coalition
@@ -146,6 +147,14 @@ type streamSender struct {
 	id       uint64
 	metadata StreamMetadata
 	decoder  *opus.Decoder
+	revoked  bool
+}
+
+// TCP membership withdrawals share the bounded dispatcher queue with UDP.
+// Only the dispatcher emits events and owns admitted sender/decoder state.
+type streamInput struct {
+	packet   []byte
+	departed []types.GUID
 }
 
 // Stream is one explicit connection epoch. It never reconnects automatically or
@@ -158,7 +167,7 @@ type Stream struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	rx           chan StreamEvent
-	packets      chan []byte
+	packets      chan streamInput
 	done         chan struct{}
 	auth         chan error
 	wg           sync.WaitGroup
@@ -225,7 +234,7 @@ func ConnectStream(ctx context.Context, config types.ClientConfiguration, option
 	config.GUID = string(types.NewGUID())
 	config.Radios = append([]types.Radio(nil), config.Radios...)
 	sessionCtx, cancel := context.WithCancel(ctx)
-	s := &Stream{config: config, opts: o, tcp: tcp, udp: udp, ctx: sessionCtx, cancel: cancel, rx: make(chan StreamEvent, o.ReceiveQueue), packets: make(chan []byte, o.PacketQueue), done: make(chan struct{}), auth: make(chan error, 1), peers: make(map[types.GUID]coalitions.Coalition), tx: make(chan struct{}, 1), sequence: 1, secure: true, udpWrite: make(chan struct{}, 1)}
+	s := &Stream{config: config, opts: o, tcp: tcp, udp: udp, ctx: sessionCtx, cancel: cancel, rx: make(chan StreamEvent, o.ReceiveQueue), packets: make(chan streamInput, o.PacketQueue), done: make(chan struct{}), auth: make(chan error, 1), peers: make(map[types.GUID]coalitions.Coalition), tx: make(chan struct{}, 1), sequence: 1, secure: true, udpWrite: make(chan struct{}, 1)}
 	// Closing sockets interrupts pending network I/O, including the initial writes.
 	stopInit := context.AfterFunc(dialCtx, func() { s.stop(ErrStreamDisconnected) })
 	defer stopInit()
@@ -371,6 +380,7 @@ func (s *Stream) readTCP() {
 				return
 			}
 		}
+		var departed []types.GUID
 		s.mu.Lock()
 		if value, ok := m.ServerSettings[string(types.CoalitionAudioSecurity)]; ok {
 			s.secure = !strings.EqualFold(strings.TrimSpace(value), "false")
@@ -388,12 +398,18 @@ func (s *Stream) readTCP() {
 				s.stop(ErrStreamQueueFull)
 				return
 			}
+			previous := s.peers
 			s.peers = make(map[types.GUID]coalitions.Coalition, len(m.Clients))
 			for _, p := range m.Clients {
 				if len(p.GUID) != types.GUIDLength {
 					continue
 				}
 				s.peers[p.GUID] = p.Coalition
+			}
+			for guid, coalition := range previous {
+				if current, present := s.peers[guid]; !present || current != coalition {
+					departed = append(departed, guid)
+				}
 			}
 		case types.MessageUpdate, types.MessageRadioUpdate:
 			if m.Client != nil && len(m.Client.GUID) == types.GUIDLength {
@@ -402,14 +418,21 @@ func (s *Stream) readTCP() {
 					s.stop(ErrStreamQueueFull)
 					return
 				}
+				if previous, present := s.peers[m.Client.GUID]; present && previous != m.Client.Coalition {
+					departed = append(departed, m.Client.GUID)
+				}
 				s.peers[m.Client.GUID] = m.Client.Coalition
 			}
 		case types.MessageClientDisconnect:
-			if m.Client != nil {
+			if m.Client != nil && len(m.Client.GUID) == types.GUIDLength {
+				departed = append(departed, m.Client.GUID)
 				delete(s.peers, m.Client.GUID)
 			}
 		}
 		s.mu.Unlock()
+		if len(departed) != 0 && !s.enqueue(streamInput{departed: departed}) {
+			return
+		}
 		if m.Type == types.MessageExternalAWACSModePassword {
 			if s.sendMessage(types.MessageRadioUpdate, "") != nil {
 				s.stop(ErrStreamDisconnected)
@@ -435,14 +458,21 @@ func (s *Stream) readUDP() {
 			continue
 		}
 		b := append([]byte(nil), buffer[:n]...)
-		select {
-		case s.packets <- b:
-		case <-s.ctx.Done():
-			return
-		default:
-			s.stop(ErrStreamQueueFull)
+		if !s.enqueue(streamInput{packet: b}) {
 			return
 		}
+	}
+}
+
+func (s *Stream) enqueue(input streamInput) bool {
+	select {
+	case s.packets <- input:
+		return true
+	case <-s.ctx.Done():
+		return false
+	default:
+		s.stop(ErrStreamQueueFull)
+		return false
 	}
 }
 func (s *Stream) pings() {
@@ -516,8 +546,21 @@ func (s *Stream) dispatch() {
 				}
 			}
 			timer = s.opts.Clock.NewTimer(StreamFrameDuration)
-		case b := <-s.packets:
-			packet, err := voice.Decode(b)
+		case input := <-s.packets:
+			for _, origin := range input.departed {
+				if state := senders[origin]; state != nil && !state.revoked {
+					state.active, state.revoked, state.decoder = false, true, nil
+					// Control carries only the formerly admitted sender GUID. No
+					// stale unit/coalition/routes/audio are presented as new input.
+					if !s.emit(StreamEvent{Kind: StreamSenderDisconnected, Metadata: StreamMetadata{OriginGUID: origin}}) {
+						return
+					}
+				}
+			}
+			if len(input.packet) == 0 {
+				continue
+			}
+			packet, err := voice.Decode(input.packet)
 			if err != nil || len(packet.AudioBytes) == 0 {
 				continue
 			}
@@ -557,6 +600,9 @@ func (s *Stream) dispatch() {
 				continue
 			}
 			state := senders[origin]
+			if state != nil && state.revoked && (!known || peer != s.config.Coalition) {
+				continue
+			}
 			if state == nil {
 				if len(senders) >= s.opts.MaxSenders {
 					s.stop(ErrStreamQueueFull)
@@ -568,6 +614,7 @@ func (s *Stream) dispatch() {
 			if state.haveLast && packet.PacketID <= state.last {
 				continue
 			}
+			state.revoked = false
 			lost := uint64(0)
 			if state.haveLast && state.active && s.opts.Clock.Now().Before(state.deadline) {
 				lost = packet.PacketID - state.last - 1

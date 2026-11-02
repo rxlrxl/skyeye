@@ -597,6 +597,10 @@ func TestStreamCoalitionMetadataAndDisconnectFiltering(t *testing.T) {
 		t.Fatalf("coalition metadata/filter: %+v", event)
 	}
 	f.serverMessage(t, types.Message{Type: types.MessageClientDisconnect, Client: &types.ClientInfo{GUID: sender}})
+	event = nextStreamEvent(t, f.stream)
+	if event.Kind != StreamSenderDisconnected || event.Metadata.OriginGUID != sender {
+		t.Fatalf("missing explicit admitted sender departure: %+v", event)
+	}
 	f.inject(streamFixturePacket(audio, sender, 3))
 	// The same known sender proves dispatch passed the disconnected peer's
 	// packet without changing either peer's metadata during that dispatch.
@@ -883,8 +887,8 @@ func TestStreamPacketQueueOverflowIsBoundedAndVisible(t *testing.T) {
 	tcp, server := net.Pipe()
 	defer server.Close()
 	udp := newStreamDatagram()
-	s := &Stream{tcp: tcp, udp: udp, ctx: ctx, cancel: cancel, packets: make(chan []byte, 1)}
-	s.packets <- []byte("already queued")
+	s := &Stream{tcp: tcp, udp: udp, ctx: ctx, cancel: cancel, packets: make(chan streamInput, 1)}
+	s.packets <- streamInput{packet: []byte("already queued")}
 	stopped := make(chan struct{})
 	go func() { s.readUDP(); close(stopped) }()
 	udp.incoming <- make([]byte, types.GUIDLength+1)
