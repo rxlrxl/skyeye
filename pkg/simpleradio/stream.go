@@ -44,6 +44,59 @@ type StreamFrame struct {
 	Opus []byte
 }
 
+// StreamTransmitGap records an interval between successful UDP voice writes.
+// AfterPacket is the one-based packet count before the interval, and Elapsed
+// ends at the later write relative to FirstWriteAt. It contains no wire identity.
+type StreamTransmitGap struct {
+	AfterPacket uint64
+	Elapsed     time.Duration
+	Gap         time.Duration
+}
+
+// StreamTransmitStats observes successful UDP voice writes within one Transmit
+// invocation. Times come from StreamOptions.Clock immediately after Write returns;
+// they establish local socket acceptance, not remote receipt or audio playback.
+// Gaps are strictly greater than their named thresholds. At most 32 gap events
+// over 60 ms are retained; aggregate counts include any events beyond that bound.
+// Empty and rejected transmissions leave all fields zero. Partial results remain
+// available when transmission fails or is canceled.
+type StreamTransmitStats struct {
+	FirstWriteAt     time.Time
+	LastWriteAt      time.Time
+	Packets          uint64
+	MaxGap           time.Duration
+	SumGap           time.Duration
+	GapsOver60MS     uint64
+	GapsOver100MS    uint64
+	GapEvents        []StreamTransmitGap
+	GapEventsDropped uint64
+}
+
+func (s *StreamTransmitStats) wrote(at time.Time) {
+	if s.Packets == 0 {
+		s.FirstWriteAt = at
+	} else {
+		gap := at.Sub(s.LastWriteAt)
+		s.SumGap += gap
+		if gap > s.MaxGap {
+			s.MaxGap = gap
+		}
+		if gap > 60*time.Millisecond {
+			s.GapsOver60MS++
+			if len(s.GapEvents) < 32 {
+				s.GapEvents = append(s.GapEvents, StreamTransmitGap{AfterPacket: s.Packets, Elapsed: at.Sub(s.FirstWriteAt), Gap: gap})
+			} else {
+				s.GapEventsDropped++
+			}
+		}
+		if gap > 100*time.Millisecond {
+			s.GapsOver100MS++
+		}
+	}
+	s.Packets++
+	s.LastWriteAt = at
+}
+
 type StreamEventKind string
 
 const (
@@ -704,6 +757,20 @@ func (s *Stream) discardPendingSender(origin types.GUID) bool {
 // is recommended). Only one producer may transmit per connection. A producer gap
 // greater than Underrun aborts the utterance; late frames are never replayed.
 func (s *Stream) Transmit(ctx context.Context, frames <-chan StreamFrame) error {
+	_, err := s.TransmitWithStats(ctx, frames)
+	return err
+}
+
+// TransmitWithStats has the same pacing, ownership, cancellation and single-
+// producer rules as Transmit. Returned observations include successful writes
+// before an error; a failed or interrupted write is never counted.
+func (s *Stream) TransmitWithStats(ctx context.Context, frames <-chan StreamFrame) (StreamTransmitStats, error) {
+	var stats StreamTransmitStats
+	err := s.transmit(ctx, frames, &stats)
+	return stats, err
+}
+
+func (s *Stream) transmit(ctx context.Context, frames <-chan StreamFrame, stats *StreamTransmitStats) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -820,7 +887,9 @@ func (s *Stream) Transmit(ctx context.Context, frames <-chan StreamFrame) error 
 			s.stop(ErrStreamDisconnected)
 			return ErrStreamDisconnected
 		}
-		next = s.opts.Clock.Now().Add(StreamFrameDuration)
+		writtenAt := s.opts.Clock.Now()
+		stats.wrote(writtenAt)
+		next = writtenAt.Add(StreamFrameDuration)
 		s.nextTransmit = next
 	}
 }
