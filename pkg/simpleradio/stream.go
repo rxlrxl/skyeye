@@ -153,8 +153,14 @@ type streamSender struct {
 // TCP membership withdrawals share the bounded dispatcher queue with UDP.
 // Only the dispatcher emits events and owns admitted sender/decoder state.
 type streamInput struct {
-	packet   []byte
-	departed []types.GUID
+	packet        []byte
+	departed      []types.GUID
+	replacePeers  bool
+	peers         map[types.GUID]coalitions.Coalition
+	peerChange    bool
+	peerGUID      types.GUID
+	peerCoalition coalitions.Coalition
+	peerPresent   bool
 }
 
 // Stream is one explicit connection epoch. It never reconnects automatically or
@@ -167,6 +173,7 @@ type Stream struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	rx           chan StreamEvent
+	pending      []StreamEvent // dispatch-owned bounded receive queue
 	packets      chan streamInput
 	done         chan struct{}
 	auth         chan error
@@ -234,7 +241,7 @@ func ConnectStream(ctx context.Context, config types.ClientConfiguration, option
 	config.GUID = string(types.NewGUID())
 	config.Radios = append([]types.Radio(nil), config.Radios...)
 	sessionCtx, cancel := context.WithCancel(ctx)
-	s := &Stream{config: config, opts: o, tcp: tcp, udp: udp, ctx: sessionCtx, cancel: cancel, rx: make(chan StreamEvent, o.ReceiveQueue), packets: make(chan streamInput, o.PacketQueue), done: make(chan struct{}), auth: make(chan error, 1), peers: make(map[types.GUID]coalitions.Coalition), tx: make(chan struct{}, 1), sequence: 1, secure: true, udpWrite: make(chan struct{}, 1)}
+	s := &Stream{config: config, opts: o, tcp: tcp, udp: udp, ctx: sessionCtx, cancel: cancel, rx: make(chan StreamEvent), packets: make(chan streamInput, o.PacketQueue), done: make(chan struct{}), auth: make(chan error, 1), peers: make(map[types.GUID]coalitions.Coalition), tx: make(chan struct{}, 1), sequence: 1, secure: true, udpWrite: make(chan struct{}, 1)}
 	// Closing sockets interrupts pending network I/O, including the initial writes.
 	stopInit := context.AfterFunc(dialCtx, func() { s.stop(ErrStreamDisconnected) })
 	defer stopInit()
@@ -380,7 +387,7 @@ func (s *Stream) readTCP() {
 				return
 			}
 		}
-		var departed []types.GUID
+		var input streamInput
 		s.mu.Lock()
 		if value, ok := m.ServerSettings[string(types.CoalitionAudioSecurity)]; ok {
 			s.secure = !strings.EqualFold(strings.TrimSpace(value), "false")
@@ -393,6 +400,7 @@ func (s *Stream) readTCP() {
 		}
 		switch m.Type {
 		case types.MessageSync:
+			input.replacePeers = true
 			if len(m.Clients) > s.opts.MaxPeers {
 				s.mu.Unlock()
 				s.stop(ErrStreamQueueFull)
@@ -408,8 +416,12 @@ func (s *Stream) readTCP() {
 			}
 			for guid, coalition := range previous {
 				if current, present := s.peers[guid]; !present || current != coalition {
-					departed = append(departed, guid)
+					input.departed = append(input.departed, guid)
 				}
+			}
+			input.peers = make(map[types.GUID]coalitions.Coalition, len(s.peers))
+			for guid, coalition := range s.peers {
+				input.peers[guid] = coalition
 			}
 		case types.MessageUpdate, types.MessageRadioUpdate:
 			if m.Client != nil && len(m.Client.GUID) == types.GUIDLength {
@@ -419,18 +431,20 @@ func (s *Stream) readTCP() {
 					return
 				}
 				if previous, present := s.peers[m.Client.GUID]; present && previous != m.Client.Coalition {
-					departed = append(departed, m.Client.GUID)
+					input.departed = append(input.departed, m.Client.GUID)
 				}
 				s.peers[m.Client.GUID] = m.Client.Coalition
+				input.peerChange, input.peerGUID, input.peerCoalition, input.peerPresent = true, m.Client.GUID, m.Client.Coalition, true
 			}
 		case types.MessageClientDisconnect:
 			if m.Client != nil && len(m.Client.GUID) == types.GUIDLength {
-				departed = append(departed, m.Client.GUID)
+				input.departed = append(input.departed, m.Client.GUID)
 				delete(s.peers, m.Client.GUID)
+				input.peerChange, input.peerGUID = true, m.Client.GUID
 			}
 		}
 		s.mu.Unlock()
-		if len(departed) != 0 && !s.enqueue(streamInput{departed: departed}) {
+		if (input.replacePeers || input.peerChange) && !s.enqueue(input) {
 			return
 		}
 		if m.Type == types.MessageExternalAWACSModePassword {
@@ -496,44 +510,41 @@ func (s *Stream) emit(e StreamEvent) bool {
 		return false
 	default:
 	}
-	select {
-	case s.rx <- e:
-		return true
-	default:
+	if len(s.pending) >= s.opts.ReceiveQueue {
 		s.stop(ErrStreamQueueFull)
 		return false
 	}
+	s.pending = append(s.pending, e)
+	return true
 }
 
 func (s *Stream) dispatch() {
 	defer func() {
-		for {
-			select {
-			case <-s.rx:
-			default:
-				close(s.rx)
-				return
-			}
-		}
+		s.pending = nil
+		close(s.rx)
 	}()
 	// High watermarks survive gap completion for this entire connection epoch.
 	// On reaching MaxSenders, terminate the connection visibly rather than
 	// evicting tombstones and admitting stale relay packets again.
 	senders := make(map[types.GUID]*streamSender)
+	// Apply membership commands in the same FIFO as UDP packets. Looking at
+	// readTCP's latest map would authorize old queued UDP from a future rejoin.
+	peers := make(map[types.GUID]coalitions.Coalition)
 	var nextID uint64
 	timer := s.opts.Clock.NewTimer(StreamFrameDuration)
 	defer func() { timer.Stop() }()
 	for {
+		var output chan StreamEvent
+		var next StreamEvent
+		if len(s.pending) != 0 {
+			output, next = s.rx, s.pending[0]
+		}
 		select {
 		case <-s.ctx.Done():
-			// Never deliver buffered audio from a dead epoch to a replacement runtime.
-			for {
-				select {
-				case <-s.rx:
-				default:
-					return
-				}
-			}
+			return
+		case output <- next:
+			s.pending[0] = StreamEvent{}
+			s.pending = s.pending[1:]
 		case <-timer.C():
 			now := s.opts.Clock.Now()
 			for _, state := range senders {
@@ -547,6 +558,16 @@ func (s *Stream) dispatch() {
 			}
 			timer = s.opts.Clock.NewTimer(StreamFrameDuration)
 		case input := <-s.packets:
+			if input.replacePeers {
+				peers = input.peers
+			}
+			if input.peerChange {
+				if input.peerPresent {
+					peers[input.peerGUID] = input.peerCoalition
+				} else {
+					delete(peers, input.peerGUID)
+				}
+			}
 			for _, origin := range input.departed {
 				if state := senders[origin]; state != nil && !state.revoked {
 					state.active, state.revoked, state.decoder = false, true, nil
@@ -596,9 +617,9 @@ func (s *Stream) dispatch() {
 				continue
 			}
 			s.mu.Lock()
-			peer, known := s.peers[origin]
 			secure := s.secure
 			s.mu.Unlock()
+			peer, known := peers[origin]
 			if secure && (!known || peer != s.config.Coalition) {
 				continue
 			}
@@ -660,26 +681,21 @@ func (s *Stream) dispatch() {
 	}
 }
 
-// Withdraw audio/gaps not yet consumed from this epoch. Already delivered
-// frames are canceled by the explicit control; other senders keep FIFO order.
-// Only dispatch calls this helper or emits to rx.
+// Withdraw audio/gaps not yet consumed from this epoch. The public rx is
+// unbuffered, so dispatch can remove queued items without racing a consumer or
+// reordering unrelated senders. Delivered frames are canceled by the control.
 func (s *Stream) discardPendingSender(origin types.GUID) bool {
-	retained := make([]StreamEvent, 0, len(s.rx))
-	for {
-		select {
-		case event := <-s.rx:
-			if event.Metadata.OriginGUID != origin || (event.Kind != StreamAudio && event.Kind != StreamGap) {
-				retained = append(retained, event)
-			}
-		default:
-			for _, event := range retained {
-				if !s.emit(event) {
-					return false
-				}
-			}
-			return true
+	retained := s.pending[:0]
+	for _, event := range s.pending {
+		if event.Metadata.OriginGUID != origin || (event.Kind != StreamAudio && event.Kind != StreamGap) {
+			retained = append(retained, event)
 		}
 	}
+	for i := len(retained); i < len(s.pending); i++ {
+		s.pending[i] = StreamEvent{}
+	}
+	s.pending = retained
+	return true
 }
 
 // Transmit consumes frames as they arrive; it sends the first immediately and

@@ -1,6 +1,7 @@
 package simpleradio
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -82,33 +83,59 @@ func TestStreamUnadmittedDepartureProducesNoControlInput(t *testing.T) {
 }
 
 func TestStreamDeparturePurgesPendingAudioAndGapButPreservesOtherSenders(t *testing.T) {
-	f := newStreamingFixture(t, nil)
 	sender := types.GUID("1111111111111111111111")
 	other := types.GUID("2222222222222222222222")
-	f.serverMessage(t, types.Message{Type: types.MessageUpdate, Client: &types.ClientInfo{GUID: sender, Coalition: coalitions.Blue}})
+	s := &Stream{ctx: context.Background(), opts: StreamOptions{ReceiveQueue: 8}}
+	before := StreamEvent{Kind: StreamAudio, Metadata: StreamMetadata{OriginGUID: other, PacketID: 1}}
+	after := StreamEvent{Kind: StreamAudio, Metadata: StreamMetadata{OriginGUID: other, PacketID: 2}}
+	s.emit(before)
+	s.emit(StreamEvent{Kind: StreamAudio, Metadata: StreamMetadata{OriginGUID: sender}})
+	s.emit(StreamEvent{Kind: StreamGap, Metadata: StreamMetadata{OriginGUID: sender}})
+	s.emit(after)
+	if !s.discardPendingSender(sender) || !reflect.DeepEqual(s.pending, []StreamEvent{before, after}) {
+		t.Fatalf("pending withdrawal reordered unrelated sender or retained old input: %+v", s.pending)
+	}
+}
+
+func TestStreamQueuedUDPBeforeRejoinCannotRestoreWithdrawnSender(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := types.GUID("1111111111111111111111")
+	clock := newManualStreamClock()
+	s := &Stream{ctx: ctx, cancel: cancel, opts: StreamOptions{Clock: clock, ReceiveQueue: 16, MaxSenders: 4, Gap: time.Second}, config: types.ClientConfiguration{Coalition: coalitions.Blue, Radios: []types.Radio{{Frequency: 251000000, Modulation: types.ModulationAM}}}, rx: make(chan StreamEvent), packets: make(chan streamInput, 16), secure: false}
 	audio := streamFixtureAudio(t)
-	f.inject(streamFixturePacket(audio, sender, 1))
-	await := func(want int) {
-		t.Helper()
-		deadline := time.Now().Add(3 * time.Second)
-		for len(f.stream.rx) != want {
-			if time.Now().After(deadline) {
-				t.Fatalf("pending receive count: got %d, want %d", len(f.stream.rx), want)
-			}
-			time.Sleep(time.Millisecond)
+	packet := func(sequence uint64) []byte {
+		value := streamFixturePacket(audio, sender, sequence)
+		return value.Encode()
+	}
+	// Queue the complete sequence before dispatch can run. Rejoin membership
+	// must not retroactively authorize UDP queued between leave and rejoin.
+	s.packets <- streamInput{peerChange: true, peerGUID: sender, peerCoalition: coalitions.Blue, peerPresent: true}
+	s.packets <- streamInput{packet: packet(1)}
+	s.packets <- streamInput{peerChange: true, peerGUID: sender, departed: []types.GUID{sender}}
+	s.packets <- streamInput{packet: packet(2)}
+	s.packets <- streamInput{peerChange: true, peerGUID: sender, peerCoalition: coalitions.Blue, peerPresent: true}
+	s.packets <- streamInput{packet: packet(3)}
+	done := make(chan struct{})
+	go func() { s.dispatch(); close(done) }()
+	defer func() { cancel(); <-done }()
+	departed := false
+	for {
+		event := nextStreamEvent(t, s)
+		if event.Kind == StreamSenderDisconnected {
+			departed = true
 		}
-	}
-	await(1)
-	f.clock.advance(320 * time.Millisecond)
-	await(2) // Old audio and inferred completion have not been consumed.
-	f.inject(streamFixturePacket(audio, other, 1))
-	await(3)
-	f.serverMessage(t, types.Message{Type: types.MessageClientDisconnect, Client: &types.ClientInfo{GUID: sender}})
-	await(2)
-	if event := nextStreamEvent(t, f.stream); event.Kind != StreamAudio || event.Metadata.OriginGUID != other {
-		t.Fatalf("departure replayed withdrawn input or reordered other sender: %+v", event)
-	}
-	if event := nextStreamEvent(t, f.stream); event.Kind != StreamSenderDisconnected || event.Metadata.OriginGUID != sender {
-		t.Fatalf("missing departure after pending audio purge: %+v", event)
+		if event.Kind != StreamAudio {
+			continue
+		}
+		if event.Metadata.PacketID == 2 {
+			t.Fatal("future rejoin authorized abandoned queued UDP")
+		}
+		if event.Metadata.PacketID == 3 {
+			if !departed {
+				t.Fatal("fresh audio preceded membership withdrawal")
+			}
+			return
+		}
 	}
 }
